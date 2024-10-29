@@ -22,7 +22,7 @@ The main objective of this sample is to create a manual approval process for new
 ### Prerequisites
 
 - Amazon Web Services (AWS) account
-- Access to Amazon Bedrock 
+- **Important** -- [Access to Amazon Bedrock Models](https://docs.aws.amazon.com/bedrock/latest/userguide/getting-started.html)
 - Basic understanding of prompt engineering and management
 
 ### Installation
