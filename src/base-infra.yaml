@@ -1,0 +1,371 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Manual approval for Prompt Management in Amazon Bedrock Infrastructure.
+
+Parameters:
+  SolutionId:
+    Type: String
+    Default: pmma123
+    AllowedPattern: '[a-z0-9]*'
+
+Resources:
+#DynamoDB
+  PromptCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Join ['', [!Ref 'SolutionId', '_prompt_catalog']]
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      AttributeDefinitions:
+        - AttributeName: promptId
+          AttributeType: S
+        - AttributeName: version
+          AttributeType: S
+      KeySchema:
+        - AttributeName: promptId
+          KeyType: HASH
+        - AttributeName: version
+          KeyType: RANGE
+
+#SNS Topic
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Join ['', [!Ref 'SolutionId', '_sns_topic']]       
+
+#API Gateway
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Join ['', [!Ref 'SolutionId', '_api']]
+      ProtocolType: HTTP
+      Description: My HTTP API Gateway
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - '*'
+        AllowMethods:
+          - GET
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  ApproveRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /approve
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ApproveApiIntegration
+
+  RejectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /reject
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref RejectApiIntegration
+
+  ApproveApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApproveLambdaFunction}'
+      PayloadFormatVersion: '1.0'
+
+  RejectApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${RejectLambdaFunction}'
+      PayloadFormatVersion: '1.0'
+ 
+#Lambda Functions    
+  TriggerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join ['', [!Ref 'SolutionId', '-trigger-dynamo']]
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TriggerLambdaRole.Arn
+      Timeout: 90
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref SNSTopic
+          API_GW_URL: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          
+          sns_client = boto3.client('sns', region_name='us-east-1')
+          api_gateway_base_url = os.environ.get('API_GW_URL')
+          topic_arn = os.environ.get('TOPIC_ARN')
+          
+          def lambda_handler(event, context):
+              print(event['Records'])
+              for record in event['Records']:
+                  if record['eventName'] == 'INSERT':
+                      new_image = record['dynamodb']['NewImage']
+                      prompt_id = new_image['promptId']['S']
+                      version = str(new_image['version']['S'])
+          
+                      # Generate approval and rejection URLs
+                      approval_url = f"{api_gateway_base_url}/approve?promptId={prompt_id}&version={version}"
+                      rejection_url = f"{api_gateway_base_url}/reject?promptId={prompt_id}&version={version}"
+          
+                      # Construct the email body
+                      email_body = f"Please review and approve/reject the new prompt version:\n\n"
+                      email_body += f"Prompt ID: {prompt_id}\n"
+                      email_body += f"Version: {version}\n\n"
+                      email_body += f"Approve: {approval_url}\n"
+                      email_body += f"Reject: {rejection_url}\n"
+          
+                      # Send the email notification using SNS
+                      try:
+                          response = sns_client.publish(
+                              TopicArn=topic_arn,
+                              Message=email_body,
+                              Subject='New Prompt Version Approval Request'
+                          )
+                      except Exception as e:
+                          print(f"Error sending SNS notification: {e}")
+          
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('DynamoDB Stream event processed successfully')
+              }
+
+  TriggerLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt PromptCatalogTable.StreamArn
+      FunctionName: !GetAtt TriggerLambdaFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 1
+
+  ApproveLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join ['', [!Ref 'SolutionId', '-approve-version']]
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ActionLambdaRole.Arn
+      Timeout: 90
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref PromptCatalogTable
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ.get('DYNAMO_TABLE'))
+          
+          def lambda_handler(event, context):
+              print(event)
+              prompt_id = event['queryStringParameters']['promptId']
+              version = str(event['queryStringParameters']['version'])
+          
+              # Update the prompt version status to 'Approved'
+              response = table.update_item(
+                  Key={
+                      'promptId': prompt_id,
+                      'version': version
+                  },
+                  UpdateExpression='SET #status = :status',
+                  ExpressionAttributeNames={
+                      '#status': 'status'
+                  },
+                  ExpressionAttributeValues={
+                      ':status': 'Approved'
+                  },
+                  ReturnValues='UPDATED_NEW'
+              )
+          
+              # Construct the HTTP response
+              http_response = {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json'
+                  },
+                  'body': json.dumps({
+                      'promptId': prompt_id,
+                      'version': version,
+                      'status': 'Approved'
+                  })
+              }
+          
+              return http_response
+
+  RejectLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join ['', [!Ref 'SolutionId', '-reject-version']]
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ActionLambdaRole.Arn
+      Timeout: 90
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref PromptCatalogTable
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ.get('DYNAMO_TABLE'))
+          
+          def lambda_handler(event, context):
+              print(event)
+              prompt_id = event['queryStringParameters']['promptId']
+              version = str(event['queryStringParameters']['version'])
+          
+              # Update the prompt version status to 'Rejected'
+              response = table.update_item(
+                  Key={
+                      'promptId': prompt_id,
+                      'version': version
+                  },
+                  UpdateExpression='SET #status = :status',
+                  ExpressionAttributeNames={
+                      '#status': 'status'
+                  },
+                  ExpressionAttributeValues={
+                      ':status': 'Rejected'
+                  },
+                  ReturnValues='UPDATED_NEW'
+              )
+          
+              # Construct the HTTP response
+              http_response = {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json'
+                  },
+                  'body': json.dumps({
+                      'promptId': prompt_id,
+                      'version': version,
+                      'status': 'Rejected'
+                  })
+              }
+          
+              return http_response
+  
+  ApproveLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApproveLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join
+        - ''
+        - - 'arn:aws:execute-api:'
+          - !Ref 'AWS::Region'
+          - ':'
+          - !Ref 'AWS::AccountId'
+          - ':'
+          - !Ref HttpApi
+          - '/*/*/approve'      
+  
+  RejectLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RejectLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join
+        - ''
+        - - 'arn:aws:execute-api:'
+          - !Ref 'AWS::Region'
+          - ':'
+          - !Ref 'AWS::AccountId'
+          - ':'
+          - !Ref HttpApi
+          - '/*/*/reject'      
+          
+  ActionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                   - 'dynamodb:UpdateItem'
+                Resource:
+                  - !GetAtt PromptCatalogTable.Arn
+
+  TriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:DescribeStream'
+                  - 'dynamodb:GetRecords'
+                  - 'dynamodb:GetShardIterator'
+                  - 'dynamodb:ListStreams'
+                Resource:
+                  - !GetAtt PromptCatalogTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource:
+                  - !Ref SNSTopic
+Outputs:
+  SNSTopicArn:
+    Description: The ARN of the SNS Topic
+    Value: !Ref SNSTopic
+    Export:
+      Name: "SNSTopicArn"
+
+  DynamoDBTableName:
+    Description: The name of the DynamoDB table
+    Value: !Ref PromptCatalogTable
+    Export:
+      Name: "DynamoDBTableName"
